@@ -1,4 +1,5 @@
-
+// https://eips.ethereum.org/EIPS/eip-20
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
 import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
@@ -9,38 +10,43 @@ import {MerkleProofUpgradeable as MerkleProof} from "@openzeppelin/contracts-upg
 
 contract DMC is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSUpgradeable {
     struct Bill {
-        address owner;              //  (Order creator)
-        uint asset;                 //  (Capacity, size in GB)
-        uint price;                 //  (Selling price)
-        uint capacity;              //  (Selling unit, less than or equal to asset)
+        address owner;              
+        uint asset;                 
+        uint price;                 
+        uint capacity;              
         uint minServiceWeek;
         uint maxServiceWeek;
-        uint depositAmount;         //  (Deposit, deducted from msg.sender)
-        uint startTime;             //  (Block time of the bill)
+        uint depositAmount;         
+        uint startTime;             
     }
     struct Order {
-        address user;               //  (User)
-        address storager;           //  (Storage provider)
-        uint asset;                 //  (Purchased capacity)
-        uint price;                 //  (Purchase price)
-        uint serviceWeek;           //  (Service period)
-        uint userDepositAmount;     //  (User's current deposit)
-        uint storageDepositAmount;  //  (Storage provider's deposit)
-        bytes32 merkleRoot;         //  (Merkle root of the order)
-        uint activeTime;            //  (Delivery start time, time > 0 indicates start of delivery)
-        uint startTime;             //  (Block time of the order)
-        uint lastWithdrawTime;      //  (Last withdrawal time)
+        address user;               
+        address storager;           
+        uint asset;                 
+        uint price;                 
+        uint serviceWeek;           
+        uint userDepositAmount;     
+        uint storageDepositAmount;  
+        bytes32 merkleRoot;         
+        uint128 piece_size;         
+        uint128 leaves;             
+        uint activeTime;            
+        uint startTime;             
+        uint lastWithdrawTime;      
+        uint billId;                
+        address firstPerpare;       
     }
     struct Challenge {
-        uint orderId;               //  (Order number to initiate challenge)
-        uint index;                 //  (Challenge block number)
-        uint challengeFee;          //  (User's challenge fee)
-        uint startTime;             //  (Block time of the challenge)
+        uint orderId;               
+        uint index;                 
+        bytes32 mhash;              
+        uint startTime;             
     }
 
     mapping(uint => Order) private orders;
     mapping(uint => Bill) private bills;
     mapping(uint => Challenge) private challenges;
+    mapping(address => string) private memos;
 
     uint curBillId;
     uint curOrderId;
@@ -49,13 +55,15 @@ contract DMC is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSUpgrade
     address lockAddress;
 
     event BillCreate(uint indexed billId, address indexed storager);
+    event BillCancel(uint indexed billId, address indexed storager, Bill bill);
     event OrderCreate(uint indexed orderId, address indexed user, address indexed storager);
     event OrderStart(uint indexed orderId, address indexed user, address indexed storager);
-    event OrderFinish(uint indexed orderId, address indexed user, address indexed storager);
+    event OrderFinish(uint indexed orderId, address indexed user, address indexed storager, Order order);
     event ChallengeStart(uint indexed challengeId, address indexed user, address indexed storager);
-    event ChallengeEnd(uint indexed challengeId, address indexed user, address indexed storager, bool success);
+    event ChallengeEnd(uint indexed challengeId, address indexed user, address indexed storager, bool success, Challenge challenge);
     // event Withdraw(uint indexed orderId, address indexed storager, uint value);
 
+    /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
@@ -92,20 +100,21 @@ contract DMC is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSUpgrade
         require(balanceOf(_msgSender()) >= depositAmount, "Insufficient balance");
         _transfer(_msgSender(), lockAddress, depositAmount);
         uint billId = curBillId++;
-        bills[curBillId++] = Bill(_msgSender(), asset, price, capacity, minServiceWeek, maxServiceWeek, depositAmount, block.timestamp);
+        bills[billId] = Bill(_msgSender(), asset, price, capacity, minServiceWeek, maxServiceWeek, depositAmount, block.timestamp);
         emit BillCreate(billId, _msgSender());
     }
 
     function cancelBill(uint billId) public {
         Bill memory bill = bills[billId];
-        require(bill.owner == _msgSender(), "only bill owner can cancel bill");
+        require(bill.owner == _msgSender(), "Permission Denied");
         _transfer(lockAddress, _msgSender(), bill.depositAmount);
+        emit BillCancel(billId, bill.owner, bill);
         delete bills[billId];
     }
 
     function createOrder(uint billId, uint asset, uint serviceWeek) public {
         Bill memory bill = bills[billId];
-        require(bill.owner != address(0), "bill not found");
+        require(bill.owner != address(0), "NotFound");
         require(asset <= bill.asset, "asset out of scope");
         require(serviceWeek <= bill.maxServiceWeek && serviceWeek >= bill.minServiceWeek, "service week out of scope");
         require(asset % bill.capacity == 0, "asset must be a multiple of capacity");
@@ -116,92 +125,109 @@ contract DMC is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSUpgrade
         bill.asset -= asset;
         bill.depositAmount -= storageDepositAmount;
         uint orderId = curOrderId++;
-        orders[orderId] = Order(_msgSender(), bill.owner, asset, bill.price, serviceWeek, userDepositAmount, storageDepositAmount, bytes32(0), 0, block.timestamp, 0);
+        orders[orderId] = Order(_msgSender(), bill.owner, asset, bill.price, serviceWeek, userDepositAmount, storageDepositAmount, bytes32(0), 0, 0, 0, block.timestamp, 0, billId, address(0));
         emit OrderCreate(orderId, _msgSender(), bill.owner);
+        if (bill.asset == 0) {
+            emit BillCancel(billId, bill.owner, bill);
+            delete bills[billId];
+        } else {
+            emit BillCreate(billId, bill.owner);
+        }
     }
 
     function cancelOrder(uint orderId) public {
         Order memory order = orders[orderId];
-        require(order.user == _msgSender(), "only order user can cancel order");
+        require(order.user == _msgSender(), "Permission Denied");
         require(order.activeTime > 0, "cannot cancel a active order");
         _transfer(lockAddress, order.user, order.userDepositAmount);
         _transfer(lockAddress, order.storager, order.storageDepositAmount);
         delete orders[orderId];
     }
 
-    function prepareChallenge(uint orderId, bytes32 merkleRoot) public {
-        require(merkleRoot != bytes32(0), "must input valid merkle root");
+    function prepareOrder(uint orderId, bytes32 merkleRoot, uint128 piece_size, uint128 leaves) public {
         Order memory order = orders[orderId];
+        require(_msgSender() == order.user || _msgSender() == order.storager, "Permission Denied");
+        require(merkleRoot != bytes32(0), "must input valid merkle root");
         require(order.activeTime == 0, "order already actived");
-        if (_msgSender() == order.user) {
-            if (order.merkleRoot == merkleRoot) {
+        if (order.merkleRoot == bytes32(0)) {
+            // first perpare
+            order.merkleRoot = merkleRoot;
+            order.piece_size = piece_size;
+            order.leaves = leaves;
+            order.firstPerpare = _msgSender();
+        } else {
+            // second prepare
+            // merkleRoot, piece_size, leaves must match
+            if (order.merkleRoot == merkleRoot && order.piece_size == piece_size && order.leaves == leaves) {
                 order.activeTime = block.timestamp;
                 order.lastWithdrawTime = block.timestamp;
                 emit OrderStart(orderId, order.user, order.storager);
-            }
-        } else {
-            if (_msgSender() == order.storager) {
-                order.merkleRoot = merkleRoot;
             } else {
-                revert("only order user or storager can prepare");
+                revert("order's merkle info mismatch!");
             }
         }
     }
 
-    function startChallenge(uint orderId, uint index, uint challengeFee) public {
+    function startChallenge(uint orderId, uint piece_index, bytes32 mhash, bytes32[] calldata proofs) public {
         Order memory order = orders[orderId];
-        require(order.user == _msgSender(), "only user can start a challenge");
-        require(balanceOf(_msgSender()) >= challengeFee, "Insufficient balance");
-        _transfer(_msgSender(), lockAddress, challengeFee);
-        uint challengeId = curChallengeId++;
-        challenges[challengeId] = Challenge(orderId, index, challengeFee, block.timestamp);
-        emit ChallengeStart(challengeId, order.user, order.storager);
+        require(order.user == _msgSender(), "Permission Denied");
+        
+        if (MerkleProof.verifyCalldata(proofs, order.merkleRoot, mhash)) {
+            uint challengeId = curChallengeId++;
+            
+            challenges[challengeId] = Challenge(orderId, piece_index, mhash, block.timestamp);
+            emit ChallengeStart(challengeId, order.user, order.storager);
+        } else {
+            revert("merkle verify mismatch!");
+        }
+        
     }
 
     function endChallenge(uint challengeId) public {
         Challenge memory challenge = challenges[challengeId];
         Order memory order = orders[challenge.orderId];
-        require(order.user == _msgSender(), "only user can end a challenge");
+        require(order.user == _msgSender(), "Permission Denied");
         require(block.timestamp > challenge.startTime + 7 days, "only can end a challenge after 7 days");
-        _transfer(lockAddress, order.user, challenge.challengeFee);
 
-       
+        
         uint userCompensation = order.storageDepositAmount / 2;
         uint forfeitedCompensation = order.storageDepositAmount - userCompensation;
-      
-        _transfer(lockAddress, order.user, order.userDepositAmount + userCompensation + challenge.challengeFee);
+        
+        _transfer(lockAddress, order.user, order.userDepositAmount + userCompensation);
         _transfer(lockAddress, owner(), forfeitedCompensation);
 
-        emit ChallengeEnd(challengeId, order.user, order.storager, false);
+        emit OrderFinish(challenge.orderId, order.user, order.storager, order);
+        emit ChallengeEnd(challengeId, order.user, order.storager, false, challenge);
         delete orders[challenge.orderId];
         delete challenges[challengeId];
     }
 
-    function proofChallenge(uint challengeId, bytes32 leaf, bytes32[] calldata proofs) public {
+    function proofChallenge(uint challengeId, bytes calldata leaf_data, bytes32[] calldata subpath) public {
         Challenge memory challenge = challenges[challengeId];
         Order memory order = orders[challenge.orderId];
-        require(order.storager == _msgSender(), "only storager can proof a challenge");
-        bool success = MerkleProof.verify(proofs, order.merkleRoot, leaf);
-        if (success) {
-            
-            _transfer(lockAddress, owner(), challenge.challengeFee);
-        } else {
+        require(order.storager == _msgSender(), "Permission Denied");
+        
+        bytes32 leaf_hash = keccak256(leaf_data);
+       
+        bool success = MerkleProof.verifyCalldata(subpath, challenge.mhash, leaf_hash);
+        if (!success) {
             
             uint userCompensation = order.storageDepositAmount / 2;
             uint forfeitedCompensation = order.storageDepositAmount - userCompensation;
-           
-            _transfer(lockAddress, order.user, order.userDepositAmount + userCompensation + challenge.challengeFee);
+            
+            _transfer(lockAddress, order.user, order.userDepositAmount + userCompensation);
             _transfer(lockAddress, owner(), forfeitedCompensation);
+            emit OrderFinish(challenge.orderId, order.user, order.storager, order);
             delete orders[challenge.orderId];
         }
         
-        emit ChallengeEnd(challengeId, order.user, order.storager, success);
+        emit ChallengeEnd(challengeId, order.user, order.storager, success, challenge);
         delete challenges[challengeId];
     }
 
     function withdrawOrder(uint orderId) public {
         Order memory order = orders[orderId];
-        require(order.storager == _msgSender(), "only storager can withdraw");
+        require(order.storager == _msgSender(), "Permission Denied");
         require(order.activeTime > 0, "order not actived");
         uint passedWeek = (block.timestamp - order.lastWithdrawTime) / 1 weeks;
         uint withdrawAmount = order.asset * order.price * passedWeek;
@@ -209,14 +235,21 @@ contract DMC is Initializable, ERC20Upgradeable, OwnableUpgradeable, UUPSUpgrade
         if (order.userDepositAmount < withdrawAmount) {
             
             _transfer(lockAddress, order.storager, order.userDepositAmount);
-            emit OrderFinish(orderId, order.user, order.storager);
+            emit OrderFinish(orderId, order.user, order.storager, order);
             delete orders[orderId];
         } else {
             order.userDepositAmount -= withdrawAmount;
             _transfer(lockAddress, order.storager, withdrawAmount);
             order.lastWithdrawTime += passedWeek * 1 weeks;
         }
-        
+    }
+
+    function set_memo(string calldata memo) public {
+        memos[_msgSender()] = memo;
+    }
+
+    function get_memo(address user) public view returns(string memory) {
+        return memos[user];
     }
 
     function getBill(uint billId) public view returns(Bill memory) {
